@@ -1,0 +1,31 @@
+# Sensitive
+c2_credentials.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Node
+node_modules/
+
+# Chrome profile
+chrome_login_profile/
+
+# Archives (not part of the published project)
+archive/
+backup/
+
+# Logs
+*.log
+*.err
+server_out.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
