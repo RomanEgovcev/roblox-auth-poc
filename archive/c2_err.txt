@@ -1,0 +1,10 @@
+Task exception was never retrieved
+future: <Task finished name='Task-2' coro=<status_loop() done, defined at C:\Users\regov\Desktop\lua\c2_server.py:627> exception=UnicodeEncodeError('charmap', '  \u25cf CheatingHitmanner (ID:11241524334) | phish_sent | 8s ago | https://browserleaks.com/ip/127.0.0.1', 2, 3, 'character maps to <undefined>')>
+Traceback (most recent call last):
+  File "C:\Users\regov\Desktop\lua\c2_server.py", line 637, in status_loop
+    print(f"  {dot} {s.name} (ID:{s.uid}) | {s.stage} | {age:.0f}s ago | https://browserleaks.com/ip/{s.ip or '?'}")
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\encodings\cp1251.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u25cf' in position 2: character maps to <undefined>

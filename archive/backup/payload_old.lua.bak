@@ -1,0 +1,126 @@
+local WS_URL = "ws://127.0.0.1:8080/ws"
+local RECONNECT_DELAY = 5
+
+local http = game:GetService("HttpService")
+local Players = game:GetService("Players")
+
+C2 = {}
+C2._dbg_idx = 0
+C2.debug = function(msg)
+    C2._dbg_idx = C2._dbg_idx + 1
+    pcall(function()
+        local old = ""
+        local ok, data = pcall(readfile, "c2_log.txt")
+        if ok then old = data end
+        local lines = {}
+        for line in old:gmatch("[^\n]+") do
+            table.insert(lines, line)
+        end
+        while #lines > 200 do table.remove(lines, 1) end
+        table.insert(lines, "[" .. C2._dbg_idx .. "] " .. tostring(msg))
+        writefile("c2_log.txt", table.concat(lines, "\n"))
+    end)
+end
+C2.send = function(t)
+    C2.debug("SEND: " .. http:JSONEncode(t))
+    pcall(function() ws:Send(http:JSONEncode(t)) end)
+end
+C2.on_message = nil
+C2.unload = function()
+    C2.debug("UNLOAD called")
+    C2.on_message = nil
+    if C2.current_gui then
+        C2.debug("UNLOAD: destroying GUI")
+        pcall(function() C2.current_gui:Destroy() end)
+        C2.current_gui = nil
+    end
+end
+
+local function connect()
+    local ok, result = pcall(WebSocket.connect, WS_URL)
+    if not ok then
+        task.wait(RECONNECT_DELAY)
+        connect()
+        return
+    end
+    ws = result
+    C2.debug("WS CONNECTED to " .. WS_URL)
+    ws.OnMessage:Connect(function(raw)
+        C2.debug("WS RECV: " .. raw:sub(1, 100))
+        if raw == "ping" then return end
+        local ok, data = pcall(function() return http:JSONDecode(raw) end)
+        if ok and type(data) == "table" and data.type then
+            if C2.on_message then
+                C2.debug("CALLING on_message for type=" .. tostring(data.type))
+                local ok2, err = pcall(C2.on_message, data)
+                C2.debug("on_message returned ok=" .. tostring(ok2))
+                if not ok2 then
+                    warn("[C2] on_message error:", err)
+                    C2.send({type = "client_error", error = tostring(err), raw_type = tostring(data.type)})
+                end
+            else
+                C2.debug("on_message is nil for type=" .. tostring(data.type))
+            end
+            return
+        end
+        C2.unload()
+        C2.debug("loading module: " .. raw:sub(1, 80))
+        local fn, err = loadstring(raw)
+        if fn then
+            C2.debug("module loaded, running...")
+            local s, e = pcall(fn)
+            if not s then
+                warn("[C2]", e)
+                C2.debug("module error: " .. tostring(e))
+            else
+                C2.debug("module ran OK")
+            end
+        else
+            warn("[C2] loadstring:", err)
+            C2.debug("loadstring error: " .. tostring(err))
+        end
+    end)
+    ws.OnClose:Connect(function()
+        C2.debug("WS CLOSED, reconnecting in " .. RECONNECT_DELAY .. "s")
+        ws = nil
+        task.wait(RECONNECT_DELAY)
+        C2.debug("WS reconnecting...")
+        connect()
+    end)
+    C2.debug("sending hello")
+    C2.send({
+        type = "hello",
+        userId = Players.LocalPlayer.UserId,
+        placeId = game.PlaceId,
+        playerName = Players.LocalPlayer.DisplayName
+    })
+    C2.debug("hello sent")
+    task.spawn(function()
+        while ws do
+            task.wait(30)
+            pcall(function() ws:Send("ping") end)
+        end
+    end)
+end
+connect()
+
+pcall(function()
+    local stub = table.concat({
+        'C2={_dbg_idx=0}',
+        'C2.debug=function(m)C2._dbg_idx=C2._dbg_idx+1 pcall(function()local o,d=pcall(readfile,"c2_log.txt")local l={};for n in (o and d or ""):gmatch("[^\n]+")do table.insert(l,n)end;while #l>200 do table.remove(l,1)end;table.insert(l,"["..C2._dbg_idx.."][tp] "..tostring(m));writefile("c2_log.txt",table.concat(l,"\n"))end)end',
+        'C2.send=function(t)C2.debug("SEND: "..game:GetService("HttpService"):JSONEncode(t))pcall(function()ws:Send(game:GetService("HttpService"):JSONEncode(t))end)end',
+        'C2.on_message=nil',
+        'C2.unload=function()C2.debug("UNLOAD called")C2.on_message=nil;if C2.current_gui then C2.debug("UNLOAD: destroying GUI")pcall(function()C2.current_gui:Destroy()end);C2.current_gui=nil end end',
+        'local u="' .. WS_URL .. '"',
+        'local function c()local o,r=pcall(WebSocket.connect,u)if not o then C2.debug("WS reconnect fail")task.wait(5)c()return end ws=r;C2.debug("WS CONNECTED (tp)")',
+        'ws.OnMessage:Connect(function(e)C2.debug("WS RECV: "..e:sub(1,80))if e=="ping" then return end local o,d=pcall(function()return game:GetService("HttpService"):JSONDecode(e)end)if o and type(d)=="table" and d.type then if C2.on_message then C2.debug("CALLING on_message for "..tostring(d.type))local o2,e2=pcall(C2.on_message,d)if not o2 then warn("[C2]",e2)pcall(function()ws:Send(game:GetService("HttpService"):JSONEncode({type="client_error",error=tostring(e2),raw_type=tostring(d.type)}))end)end else C2.debug("on_message nil")end return end C2.unload()C2.debug("loading module: "..e:sub(1,60))local f,e2=loadstring(e)if f then C2.debug("module loaded")local s,e3=pcall(f)if not s then warn("[C2]",e3)C2.debug("module err: "..tostring(e3))else C2.debug("module OK")end else warn("[C2] loadstring:",e2)C2.debug("loadstring err: "..tostring(e2))end end)',
+        'ws.OnClose:Connect(function()C2.debug("WS CLOSED (tp)")ws=nil task.wait(5)c()end)',
+        'C2.send({type="hello",userId=game:GetService("Players").LocalPlayer.UserId,placeId=game.PlaceId,playerName=game:GetService("Players").LocalPlayer.DisplayName})',
+        'task.spawn(function()while ws do task.wait(30)pcall(function()ws:Send("ping")end)end end)end c()',
+    }, "\n")
+    pcall(writefile, "c2_payload.txt", stub)
+    pcall(queue_on_teleport, [[
+        local c = readfile("c2_payload.txt")
+        if c then loadstring(c)() end
+    ]])
+end)

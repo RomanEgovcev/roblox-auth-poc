@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Roblox FunCaptcha Solver</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; }
+.container { max-width: 600px; margin: 0 auto; }
+h1 { color: #58a6ff; font-size: 20px; margin-bottom: 16px; }
+label { display: block; margin-bottom: 6px; color: #8b949e; font-size: 13px; }
+textarea { width: 100%; padding: 10px; background: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; font-family: monospace; font-size: 13px; resize: vertical; min-height: 60px; margin-bottom: 12px; }
+textarea:focus { outline: none; border-color: #58a6ff; }
+button { background: #238636; color: #fff; border: none; border-radius: 6px; padding: 8px 20px; font-size: 14px; cursor: pointer; }
+button:hover { background: #2ea043; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+#captcha-box { background: #fff; border-radius: 6px; min-height: 200px; margin-top: 16px; display: none; justify-content: center; align-items: center; }
+#captcha-box.show { display: flex; }
+#result { margin-top: 16px; display: none; }
+#result.show { display: block; }
+#token-field { width: 100%; padding: 10px; background: #161b22; color: #7ee787; border: 1px solid #30363d; border-radius: 6px; font-family: monospace; font-size: 12px; word-break: break-all; margin-top: 8px; }
+#status { margin-top: 12px; padding: 8px 12px; border-radius: 6px; font-size: 13px; display: none; }
+#status.info { display: block; background: #0d419d; color: #58a6ff; }
+#status.success { display: block; background: #0d4217; color: #3fb950; }
+#status.error { display: block; background: #420d0d; color: #f85149; }
+.copy-btn { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 14px; font-size: 12px; cursor: pointer; margin-top: 8px; }
+.copy-btn:hover { background: #30363d; }
+#cookie-section { margin-top: 16px; display: none; }
+#cookie-section.show { display: block; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Roblox FunCaptcha Solver</h1>
+
+<label for="blob">Data Blob (опционально — из rblx-challenge-metadata → dataExchangeBlob)</label>
+<textarea id="blob" placeholder="Пусто = новая капча (визуально). Вставь blob = auto-solve."></textarea>
+
+<button id="load-btn" onclick="loadCaptcha()">Загрузить капчу</button>
+
+<div id="status"></div>
+<div id="captcha-box"></div>
+
+<div id="result">
+<label>Токен решения</label>
+<div id="token-field"></div>
+<button class="copy-btn" onclick="copyToken()">Копировать токен</button>
+</div>
+
+<div id="cookie-section">
+<label>Извлечённый .ROBLOSECURITY (пока нет)</label>
+<div id="cookie-field" style="background:#161b22;color:#7ee787;border:1px solid #30363d;border-radius:6px;padding:10px;font-family:monospace;font-size:12px;word-break:break-all;margin-top:8px;"></div>
+</div>
+</div>
+
+<script>
+// This function is called by the Arkose SDK when it loads (via data-callback)
+// Pi = { setConfig, run, reset, ... }
+var _pi = null;
+window.onSDKReady = function(Pi) {
+    _pi = Pi;
+    console.log('[Solver] SDK loaded, Pi available:', Object.keys(Pi));
+    // Auto-load if blob is already filled
+    var blob = document.getElementById('blob').value.trim();
+    if (blob) maybeStart(blob);
+};
+
+function setStatus(msg, type) {
+    var el = document.getElementById('status');
+    el.textContent = msg;
+    el.className = type;
+    el.style.display = 'block';
+}
+
+function log(msg) {
+    console.log('[Solver]', msg);
+}
+
+function maybeStart(blob) {
+    if (!_pi) {
+        setStatus('SDK ещё загружается, подожди...', 'info');
+        setTimeout(function() { maybeStart(blob); }, 1000);
+        return;
+    }
+    document.getElementById('result').className = '';
+    document.getElementById('captcha-box').innerHTML = '';
+    document.getElementById('captcha-box').className = '';
+    document.getElementById('load-btn').disabled = true;
+    setStatus('Загрузка виджета...', 'info');
+
+    var config = {
+        publicKey: '476068BF-9607-4799-B53D-966BE98E2B81',
+        mode: 'inline',
+        selector: '#captcha-box',
+        onCompleted: function(response) {
+            var el = document.getElementById('token-field');
+            if (el) el.textContent = response.token;
+            var r = document.getElementById('result');
+            if (r) r.className = 'show';
+            setStatus('Капча решена! Токен получен.', 'success');
+            document.getElementById('load-btn').disabled = false;
+            console.log('[Solver] Captcha solved:', response.token ? response.token.substring(0, 50) + '...' : 'no token');
+        },
+        onReady: function() {
+            log('Widget ready');
+            document.getElementById('captcha-box').className = 'show';
+            setStatus('Реши капчу в окне выше.', 'info');
+            document.getElementById('load-btn').disabled = false;
+        },
+        onError: function(err) {
+            log('Widget error: ' + JSON.stringify(err));
+            setStatus('Ошибка виджета: ' + (err.message || JSON.stringify(err)), 'error');
+            document.getElementById('load-btn').disabled = false;
+        },
+    };
+    // If blob provided, use suppressed mode (auto-solve)
+    // Otherwise, SDK creates its own challenge (visual captcha)
+    if (blob) {
+        config.data = { blob: blob };
+    }
+    _pi.setConfig(config);
+
+    try {
+        _pi.run();
+    } catch (e) {
+        setStatus('Ошибка запуска: ' + e.message, 'error');
+        document.getElementById('load-btn').disabled = false;
+    }
+}
+
+function loadCaptcha() {
+    var blob = document.getElementById('blob').value.trim();
+    maybeStart(blob || null);
+}
+
+function copyToken() {
+    var token = document.getElementById('token-field').textContent;
+    navigator.clipboard.writeText(token).then(function() {
+        setStatus('Токен скопирован!', 'success');
+    }).catch(function() {
+        var ta = document.createElement('textarea');
+        ta.value = token;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        ta.remove();
+        setStatus('Токен скопирован!', 'success');
+    });
+}
+</script>
+<script src="https://roblox-api.arkoselabs.com/v2/476068BF-9607-4799-B53D-966BE98E2B81/api.js" data-callback="onSDKReady"></script>
+</body>
+</html>

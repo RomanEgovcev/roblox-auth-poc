@@ -1,0 +1,7 @@
+2026-07-14 23:11:36,803 server listening on 0.0.0.0:8080
+2026-07-14 23:11:36,809 WebSocket server on ws://0.0.0.0:8080
+2026-07-14 23:11:37,681 connection open
+2026-07-14 23:11:37,686 Client connected
+2026-07-14 23:11:37,753 Client hello: user=CheatingHitmanner id=11241524334 place=123974602339071
+2026-07-14 23:11:37,760 Sent phish.lua module
+2026-07-14 23:12:09,058 Client: closed

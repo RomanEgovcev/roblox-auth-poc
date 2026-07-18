@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Roblox Arkose Solver</title>
+    <!-- Добавлен data-callback, который строго требует Arkose API для успешной загрузки -->
+    <script src="https://api.arkoselabs.com/v2/476068BF-9607-4799-B53D-966BE98E2B81/api.js" data-callback="onCompleted"></script>
+    <style>
+        body { font-family: monospace; background: #1a1a1a; color: #0f0; padding: 20px; }
+        #captcha-container { margin-top: 20px; background: #fff; padding: 10px; border-radius: 8px; min-height: 200px; }
+        .log { margin: 5px 0; padding: 5px; background: #222; border-left: 3px solid #0f0; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <h2>🔐 Ручное решение капчи Roblox</h2>
+    <label>Вставь <b>dataBlob</b> или <b>sessionId</b>:</label>
+    <input type="text" id="blobInput" placeholder="Вставь сюда..." style="width: 100%; padding: 10px; margin: 10px 0; background: #333; color: #fff; border: 1px solid #0f0; border-radius: 4px;">
+    <button onclick="runCaptcha()" style="padding: 10px 20px; cursor: pointer; background: #0f0; color: #000; font-weight: bold; border: none; border-radius: 4px;">Загрузить капчу</button>
+    <div id="captcha-container"></div>
+    <div id="log" style="margin-top: 20px;"></div>
+    <div id="result" style="margin-top: 20px; word-break: break-all; color: #ff0;"></div>
+
+    <script>
+        // Глобальная функция, которую ждёт api.js благодаря атрибуту data-callback
+        window.onCompleted = function(response) {
+            const logDiv = document.getElementById('log');
+            const entry = document.createElement('div');
+            entry.className = 'log';
+            entry.style.borderLeftColor = '#0f0';
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ✅ Капча успешно решена!`;
+            logDiv.appendChild(entry);
+            
+            const token = response.token;
+            document.getElementById('result').innerHTML = 
+                "<b>✅ TOKEN ПОЛУЧЕН:</b><br><textarea style='width:100%;height:100px;margin-top:10px;background:#222;color:#0f0;border:1px solid #0f0;padding:5px;' readonly>" + 
+                token + "</textarea>";
+        };
+
+        function log(msg, type = "info") {
+            const logDiv = document.getElementById('log');
+            const entry = document.createElement('div');
+            entry.className = 'log';
+            entry.style.borderLeftColor = type === 'error' ? '#f00' : '#0f0';
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            logDiv.appendChild(entry);
+            console.log(msg);
+        }
+
+        function runCaptcha() {
+            const input = document.getElementById('blobInput').value.trim();
+            if (!input) {
+                alert("Вставь dataBlob или sessionId!");
+                return;
+            }
+            
+            document.getElementById('captcha-container').innerHTML = '';
+            document.getElementById('result').innerHTML = '';
+            log("Запуск виджета...");
+
+            let config = {
+                publicKey: "476068BF-9607-4799-B53D-966BE98E2B81",
+                mode: "inline",
+                element: "captcha-container",
+                onReady: function() {
+                    log("Виджет готов к использованию. Решай капчу!");
+                },
+                onError: function(response) {
+                    log("❌ Ошибка виджета: " + JSON.stringify(response), "error");
+                }
+            };
+
+            if (input.length > 100) {
+                log("Обнаружен dataBlob, инициализация...");
+                config.data = { blob: input };
+            } else if (input.includes('-')) {
+                log("Обнаружен sessionId, инициализация...");
+                config.sessionId = input;
+            } else {
+                log("Неизвестный формат, пробуем как dataBlob", "error");
+                config.data = { blob: input };
+            }
+
+            try {
+                if (typeof ArkoseEnforcement === 'undefined') {
+                    log("❌ ArkoseEnforcement не определён. Проверь консоль (F12) на ошибки сети или отключи блокировщик рекламы.", "error");
+                    return;
+                }
+                new ArkoseEnforcement(config).run();
+                log("ArkoseEnforcement запущен");
+            } catch (e) {
+                log("❌ Критическая ошибка JS: " + e.message, "error");
+            }
+        }
+        log("HTML загружен. SDK должен загрузиться автоматически.");
+    </script>
+</body>
+</html>

@@ -1,0 +1,3 @@
+[TG] Bot started
+[TG] proxy failed, fallback to direct
+[TG] send error: HTTPSConnectionPool(host='api.telegram.org', port=443): Max retries exceeded with url: /bot8676041886:AAF7z6Okysn167jN3bsw2W4CUzmr_dnnMlk/sendMessage (Caused by ConnectTimeoutError(<HTTPSConnection(host='api.telegram.org', port=443) at 0x1c96e874830>, 'Connection to api.telegram.org timed out. (connect timeout=10)'))

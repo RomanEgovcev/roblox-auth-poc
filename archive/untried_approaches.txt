@@ -1,0 +1,20 @@
+=== Непробованные подходы (капча OOPIF) ===
+
+1. Запустить сервер от Администратора — UIPI блокирует SetForegroundWindow
+
+2. Event.prototype.isTrusted override через Page.addScriptToEvaluateOnNewDocument
+   - Одна строка: Object.defineProperty(Event.prototype, 'isTrusted', {get: () => true});
+   - Выполняется ДО загрузки страницы (в отличие от Runtime.evaluate)
+   - Нужно вызвать на OOPIF-сессии в момент auto-attach
+
+3. MV2 Extension — all_frames: true работает в OOPIF (но Chrome удаляет MV2)
+
+4. MutationObserver с главной страницы
+   - Через CDP Runtime.evaluate на main page ловим iframe
+   - Патчим prototypes через contentWindow (работает с --disable-web-security)
+
+5. Fetch.enable() — подмена ответов captcha SDK через CDP Network
+
+6. postMessage manipulation — после клика перехватываем postMessage от iframe, подсовываем фейковый токен
+
+7. chrome.scripting.executeScript({world: "MAIN"}) через extension в OOPIF

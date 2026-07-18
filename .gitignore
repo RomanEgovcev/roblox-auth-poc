@@ -13,10 +13,6 @@ node_modules/
 # Chrome profile
 chrome_login_profile/
 
-# Archives (not part of the published project)
-archive/
-backup/
-
 # Logs
 *.log
 *.err

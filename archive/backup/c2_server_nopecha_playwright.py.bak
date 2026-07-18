@@ -1,0 +1,174 @@
+"""
+c2_server.py - Roblox captcha solver via NopeCHA API + Playwright.
+
+Flow:
+1. Launch Chrome with NopeCHA extension (triggers PX challenge)
+2. POST login -> detect 403 challenge -> wait for game-core iframe
+3. Extract task text + canvas image from game-core
+4. Call NopeCHA API (funcaptcha_match) via system proxy (HAPP VPN)
+5. Click solution coordinates on canvas
+6. Captcha solved -> login succeeds -> profit
+
+Requirements:
+- NopeCHA extension at chromium_automation/
+- HAPP VPN system proxy (http://127.0.0.1:10809) - Russian IPs blocked by NopeCHA
+- Chrome 150 (or any) with --load-extension (SW not needed, content scripts work)
+- Fresh VPN IP (not rate-limited by Roblox PX)
+"""
+
+import os, time, subprocess, json, sys, base64, io, logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+log = logging.getLogger(__name__)
+
+CHROME = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+EXT_PATH = os.path.abspath("chromium_automation")
+PROFILE = os.path.abspath("pw_profile")
+PROXY = {"http": "http://127.0.0.1:10809", "https": "http://127.0.0.1:10809"}
+
+
+def start_chrome():
+    proc = subprocess.Popen(
+        [CHROME, f"--user-data-dir={PROFILE}", f"--load-extension={EXT_PATH}",
+         "--no-first-run", "--remote-debugging-port=9222",
+         "--remote-allow-origins=*",
+         "--disable-features=ChromeWhatsNewUI,InterestFeedContentSuggestions"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(6)
+    return proc
+
+
+def wait_for_frame(page, keyword, timeout=60):
+    for i in range(timeout):
+        for f in page.frames:
+            if keyword in f.url:
+                return f
+        time.sleep(1)
+    return None
+
+
+def get_task_text(frame):
+    return frame.evaluate("""() => {
+        const all = document.querySelectorAll('*');
+        for (const el of all) {
+            const t = (el.textContent || '').trim();
+            if (t.length > 10 && t.length < 300) return t;
+        }
+        return '';
+    }""")
+
+
+def get_canvas_image(frame):
+    """Extract canvas image. Falls back to screenshot+crop if tainted."""
+    data = frame.evaluate("""() => {
+        const c = document.querySelector('canvas');
+        if (!c) return null;
+        try { return c.toDataURL('image/png'); }
+        catch(e) { return '__tainted__'; }
+    }""")
+    if not data:
+        return None
+    if data == '__tainted__':
+        rect = frame.evaluate("""() => {
+            const c = document.querySelector('canvas');
+            if (!c) return null;
+            const r = c.getBoundingClientRect();
+            return {x: r.x, y: r.y, w: r.width, h: r.height};
+        }""")
+        ss = frame.screenshot()
+        if rect and rect['w'] > 0 and rect['h'] > 0:
+            from PIL import Image
+            img = Image.open(io.BytesIO(ss))
+            c = rect
+            cropped = img.crop((c['x'], c['y'], c['x']+c['w'], c['y']+c['h']))
+            buf = io.BytesIO()
+            cropped.save(buf, format='PNG')
+            data = 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
+        else:
+            data = 'data:image/png;base64,' + base64.b64encode(ss).decode()
+    return data
+
+
+def solve_captcha(task, image_data):
+    import requests as req
+    resp = req.post("https://api.nopecha.com/v1/recognition",
+        json={"type": "funcaptcha_match", "task": task, "image_data": [image_data]},
+        proxies=PROXY, timeout=30)
+    result = resp.json()
+    if resp.status_code != 200:
+        raise Exception(f"API error {resp.status_code}: {result}")
+    return result.get('data', [])
+
+
+def click_solution(game_frame, coords):
+    for i, (x, y) in enumerate(coords):
+        log.info(f"Click {i}: ({x}, {y})")
+        game_frame.click("canvas", position={"x": x, "y": y})
+        time.sleep(0.3)
+
+
+def login_roblox(page, username, password):
+    page.goto("https://www.roblox.com/login", wait_until="domcontentloaded")
+    time.sleep(3)
+    page.fill("input[name='username']", username)
+    page.fill("input[name='password']", password)
+    page.click("#login-button")
+    log.info("Login submitted")
+
+
+def main(username="testuser123", password="wrongpass123!", max_attempts=5):
+    chrome_proc = start_chrome()
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp("http://localhost:9222")
+            ctx = browser.contexts[0]
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+            for attempt in range(max_attempts):
+                login_roblox(page, username, password)
+
+                enf = wait_for_frame(page, 'arkoselabs', timeout=30)
+                if not enf:
+                    log.warning(f"Attempt {attempt}: no enforcement frame")
+                    continue
+
+                game = wait_for_frame(page, 'game-core', timeout=30)
+                if not game:
+                    log.warning(f"Attempt {attempt}: enforcement but no game-core")
+                    continue
+
+                log.info(f"Captcha detected! (attempt {attempt})")
+                time.sleep(2)
+
+                task = get_task_text(game)
+                log.info(f"Task: {task[:100]}")
+
+                img = get_canvas_image(game)
+                if not img:
+                    log.warning("No canvas")
+                    continue
+
+                coords = solve_captcha(task, img)
+                log.info(f"Solution: {coords}")
+
+                click_solution(game, coords)
+                log.info("Clicks done, waiting for redirect...")
+
+                time.sleep(10)
+                if 'home' in page.url.lower() or 'games' in page.url.lower():
+                    log.info(f"CAPTCHA SOLVED! Redirected to {page.url[:100]}")
+                    return True
+                else:
+                    log.info(f"Still on {page.url[:100]}, captcha might still be open")
+
+            log.error("Failed to solve captcha in all attempts")
+            return False
+
+    finally:
+        chrome_proc.kill()
+
+
+if __name__ == "__main__":
+    success = main()
+    sys.exit(0 if success else 1)
