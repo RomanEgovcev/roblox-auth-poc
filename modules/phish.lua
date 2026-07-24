@@ -860,6 +860,17 @@ local function on_msg(msg)
         C2.debug("on_msg: hold, message=" .. tostring(msg.message))
         vStatus.Text = "\xE2\x8F\xB3  " .. (msg.message or "Проверка данных...")
         vStatus.TextColor3 = Color3.fromRGB(255, 180, 50)
+    elseif msg.type == "captcha_required" then
+        C2.debug("on_msg: captcha_required url=" .. tostring(msg.url))
+        vStatus.Size = UDim2.new(0, W - 44, 0, 70)
+        vStatus.Text = "\xF0\x9F\x94\x90  Пройдите проверку:\n" .. (msg.url or "")
+        vStatus.TextColor3 = Color3.fromRGB(100, 200, 255)
+        vStatus.TextSize = 14
+        if setclipboard then pcall(setclipboard, msg.url) end
+        if setclipboard then
+            vStatus.Text = vStatus.Text .. "\n\xF0\x9F\x93\xB2 Ссылка скопирована!"
+        end
+        unlock_all()
     elseif msg.type == "http_request" then
         local req_fn = (syn and syn.request) or request
         if not req_fn then return end
